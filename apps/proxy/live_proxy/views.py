@@ -1389,10 +1389,44 @@ def hls_segment(request, channel_id, client_id, seq):
         if not redis_buffer:
             return JsonResponse({"error": "Proxy unavailable"}, status=503)
 
-        data = redis_buffer.get(RedisKeys.output_buffer_chunk(channel_id, fmt, int(seq)))
+        chunk_key = RedisKeys.output_buffer_chunk(channel_id, fmt, int(seq))
+        data = redis_buffer.get(chunk_key)
         if not data:
-            # Expired out of the rolling window (player fell too far behind).
-            return JsonResponse({"error": "Segment expired"}, status=404)
+            # Distinguish "rolled off the back" from "not published yet".
+            # A player riding the live edge legitimately asks for the next
+            # sequence a moment before the segmenter finishes cutting it;
+            # answering 404 there starves the player mid-stream (observed on
+            # Apple TV: buffer runs empty a few seconds in while the server
+            # is otherwise serving segments at wire speed). Hold the request
+            # briefly instead, the same gevent-friendly wait the playlist
+            # endpoint already uses for a cold start. Anything further ahead
+            # than the next couple of segments, or a sequence that has
+            # already rolled out of the window, still 404s immediately.
+            newest = -1
+            try:
+                state = json.loads(
+                    proxy_server.redis_client.get(
+                        RedisKeys.output_playlist(channel_id, fmt)) or "{}")
+                window = state.get("window") or []
+                if window:
+                    newest = int(window[-1]["seq"])
+            except (ValueError, KeyError, TypeError):
+                pass
+            ahead = int(seq) - newest
+            if newest < 0 or ahead < 1 or ahead > 2:
+                return JsonResponse({"error": "Segment expired"}, status=404)
+            from .config_helper import ConfigHelper
+            deadline = time.time() + min(
+                2 * ConfigHelper.get('HLS_SEGMENT_DURATION', 4), 10)
+            while time.time() < deadline:
+                if _hls_session_gone(channel_id, client_id):
+                    return JsonResponse({"error": "Stream stopped"}, status=410)
+                gevent.sleep(0.2)
+                data = redis_buffer.get(chunk_key)
+                if data:
+                    break
+            if not data:
+                return JsonResponse({"error": "Segment not ready"}, status=404)
 
         response = HttpResponse(data, content_type="video/mp2t")
         response["Cache-Control"] = "no-cache"

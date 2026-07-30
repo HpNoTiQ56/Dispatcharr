@@ -175,7 +175,7 @@ class HLSOutputManager:
         # is the control case for the Apple TV "buffer ran empty ~10s in"
         # investigation. Settable without a rebuild via the proxy setting
         # HLS_STARTUP_KEYFRAME_CUTS.
-        starter_cuts = ConfigHelper.get('HLS_STARTUP_KEYFRAME_CUTS', 0)
+        starter_cuts = ConfigHelper.get('HLS_STARTUP_KEYFRAME_CUTS', 4)
         logger.info(
             f"[HLS:{self.channel_id}] fast-start ladder: {starter_cuts} starter cuts"
         )
