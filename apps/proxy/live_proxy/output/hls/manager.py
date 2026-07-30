@@ -169,9 +169,20 @@ class HLSOutputManager:
 
     def _segmenter_loop(self):
         """Read TS chunks from Redis and feed them through the segmenter."""
+        # TEST-BRANCH A/B KNOB (not on the PR): number of per-keyframe
+        # starter cuts. 4 = fast-start ladder as shipped on pr/hls-output;
+        # 0 = ladder OFF (every segment uses the normal cut target), which
+        # is the control case for the Apple TV "buffer ran empty ~10s in"
+        # investigation. Settable without a rebuild via the proxy setting
+        # HLS_STARTUP_KEYFRAME_CUTS.
+        starter_cuts = ConfigHelper.get('HLS_STARTUP_KEYFRAME_CUTS', 0)
+        logger.info(
+            f"[HLS:{self.channel_id}] fast-start ladder: {starter_cuts} starter cuts"
+        )
         segmenter = TSSegmenter(
             target_duration=self.segment_duration,
             max_segment_duration=self.adv_target,
+            startup_keyframe_cuts=starter_cuts,
         )
 
         # Start behind live so the first segments cover the same window a
