@@ -6,7 +6,7 @@ name: Build HLS test image
 
 on:
   push:
-    branches: [hls-current]
+    branches: [hls-feature-propre]
   workflow_dispatch:
 
 permissions:
