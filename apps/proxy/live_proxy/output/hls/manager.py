@@ -40,11 +40,9 @@ HLS_OWNER_TTL = 60
 # HLS segmenter knobs (code-level ConfigHelper / TSConfig attrs). Not exposed
 # in the DB-backed Proxy Settings UI; add CoreSettings keys later if needed.
 DEFAULT_SEGMENT_DURATION = 4
-# Retain 10 segments (~40s) in the rolling live window. A player starts
-# near the live edge regardless of window length, so a longer window adds
-# no latency; it only keeps older segments available so a client that
-# briefly falls behind (a stall, a slow network hiccup) can still fetch the
-# segment it is on instead of getting a 404 once it has rolled off.
+# Target Redis retention depth for finished HLS segments (used to size chunk
+# TTL). The advertised playlist window tracks whatever is still in Redis
+# (minus a segment about to expire), not this fixed count.
 DEFAULT_WINDOW_SIZE = 10
 
 # Demand self-check. HLS clients are pull-based: there is no long-lived
@@ -83,6 +81,10 @@ class HLSOutputManager:
         # covers the normal keyframe overrun past the cut threshold. 2x target
         # was also truthful but inflated live latency roughly in proportion.
         self.adv_target = int(self.segment_duration + 2 + 0.999)
+        # Preferred client join offset; same setting the segmenter uses when
+        # seeding from the input buffer. Frozen for the playlist lifetime so
+        # EXT-X-START does not change across reloads (RFC 8216 6.2.1).
+        self.start_behind = float(ConfigHelper.new_client_behind_seconds() or 0)
 
         # Same Redis-backed chunk store other output managers use; it is
         # format-parameterized by design ("adding a new output format only
@@ -93,9 +95,8 @@ class HLSOutputManager:
         )
         # Size the chunk TTL for post-removal availability (RFC 8216 6.2.2):
         # after a segment rolls off it must stay fetchable for roughly the
-        # segment duration plus the longest playlist that contained it. A short
-        # default TTL cannot back a 10-segment window of 5-6.5s segments, which
-        # 404s the window tail during stall recovery.
+        # segment duration plus the longest playlist that contained it. Floor
+        # from window_size so retention stays deep enough for stall recovery.
         try:
             self.segment_buffer.chunk_ttl = max(
                 self.segment_buffer.chunk_ttl,
@@ -107,6 +108,9 @@ class HLSOutputManager:
         self._window = []
         # EXT-X-DISCONTINUITY tags that have already slid out of the window.
         self._disc_sequence = 0
+        # Playlist "ts" is last segment production, not last Redis write, so
+        # prune-only republishes do not mask a stalled producer as live.
+        self._last_segment_ts = None
         # Seed the rolling window + frozen target from an existing descriptor so
         # a mid-session worker restart/takeover does not clobber the playlist to
         # a fresh window (MEDIA-SEQUENCE must never regress; RFC 8216 6.2.2). The
@@ -121,7 +125,12 @@ class HLSOutputManager:
                         self._window = prior["window"]
                     if prior.get("adv_target"):
                         self.adv_target = prior["adv_target"]
+                    if prior.get("start_behind") is not None:
+                        self.start_behind = float(prior["start_behind"])
                     self._disc_sequence = int(prior.get("disc_seq") or 0)
+                    if prior.get("ts") is not None:
+                        self._last_segment_ts = float(prior["ts"])
+                    self._prune_playlist_window()
             except Exception:
                 pass
 
@@ -138,6 +147,10 @@ class HLSOutputManager:
         self.running = True
         self._set_state(HLS_STATE_INITIALIZING)
 
+        # __init__ pruned any seeded window in memory only; publish now that we own.
+        if self._last_segment_ts is not None:
+            self._write_playlist_state()
+
         short_id = self.channel_id[:8]
         self._thread = threading.Thread(
             target=self._segmenter_loop, daemon=True,
@@ -147,7 +160,7 @@ class HLSOutputManager:
 
         logger.info(
             f"[HLS:{self.channel_id}] Started "
-            f"(target={self.segment_duration}s, window={self.window_size})"
+            f"(target={self.segment_duration}s, redis_ttl={self.segment_buffer.chunk_ttl}s)"
         )
         return True
 
@@ -185,20 +198,9 @@ class HLSOutputManager:
 
     def _segmenter_loop(self):
         """Read TS chunks from Redis and feed them through the segmenter."""
-        # TEST-BRANCH A/B KNOB (not on the PR): number of per-keyframe
-        # starter cuts. 4 = fast-start ladder as shipped on pr/hls-output;
-        # 0 = ladder OFF (every segment uses the normal cut target), which
-        # is the control case for the Apple TV "buffer ran empty ~10s in"
-        # investigation. Settable without a rebuild via the proxy setting
-        # HLS_STARTUP_KEYFRAME_CUTS.
-        starter_cuts = ConfigHelper.get('HLS_STARTUP_KEYFRAME_CUTS', 4)
-        logger.info(
-            f"[HLS:{self.channel_id}] fast-start ladder: {starter_cuts} starter cuts"
-        )
         segmenter = TSSegmenter(
             target_duration=self.segment_duration,
             max_segment_duration=self.adv_target,
-            startup_keyframe_cuts=starter_cuts,
         )
         if self._window:
             # Seeded from a previous owner's descriptor: our first segment
@@ -207,8 +209,8 @@ class HLSOutputManager:
             segmenter.flag_discontinuity()
 
         # Start behind live so the first segments cover the same window a
-        # new TS client would receive, matching fMP4 writer positioning.
-        behind_seconds = ConfigHelper.new_client_behind_seconds()
+        # new TS client would receive.
+        behind_seconds = self.start_behind
         start_index = self.ts_buffer.find_chunk_index_by_time(behind_seconds) if behind_seconds > 0 else None
         if start_index is None:
             start_index = self.ts_buffer.index
@@ -232,6 +234,9 @@ class HLSOutputManager:
                     self._heartbeat_ownership()
                     if not self.running:
                         break
+                    # Drop expired advertised URIs while the input is stalled.
+                    if self._prune_playlist_window() and self._last_segment_ts is not None:
+                        self._write_playlist_state()
                     if self._has_hls_demand():
                         idle_demand_checks = 0
                     else:
@@ -316,6 +321,70 @@ class HLSOutputManager:
             f"{f' ({reason})' if reason else ''}; next segment will be marked"
         )
 
+    def _prune_playlist_window(self):
+        """Align the advertised window with segments still in Redis (RFC 8216 6.2.2).
+
+        Returns True when the window or discontinuity sequence changed.
+        """
+        before = (len(self._window), self._disc_sequence,
+                  self._window[0]["seq"] if self._window else None)
+        scores = {}
+        try:
+            scores = self.segment_buffer.surviving_chunk_scores()
+        except Exception:
+            scores = {}
+        if not scores:
+            # Lookup failed: cap growth so _window cannot run away while
+            # put_chunk() still succeeds. Normal path is the TTL prune below.
+            max_entries = int(self.segment_buffer.chunk_ttl / max(self.segment_duration, 1)) + 5
+            changed = False
+            while len(self._window) > max_entries:
+                if self._window.pop(0).get("disc"):
+                    self._disc_sequence += 1
+                changed = True
+            return changed
+
+        live = set(scores)
+        # Prefix-only: mid-window holes would corrupt DISCONTINUITY-SEQUENCE.
+        while self._window and self._window[0]["seq"] not in live:
+            if self._window.pop(0).get("disc"):
+                self._disc_sequence += 1
+
+        # Omit leading chunks within one segment of TTL expiry; keep a sole entry.
+        now = time.time()
+        while len(self._window) > 1:
+            written_at = scores[self._window[0]["seq"]]
+            remaining = self.segment_buffer.chunk_ttl - (now - written_at)
+            if remaining >= self.segment_duration:
+                break
+            if self._window.pop(0).get("disc"):
+                self._disc_sequence += 1
+
+        after = (len(self._window), self._disc_sequence,
+                 self._window[0]["seq"] if self._window else None)
+        return after != before
+
+    def _write_playlist_state(self):
+        """Publish the current window descriptor to Redis."""
+        if not self._redis:
+            return
+        try:
+            playlist_state = {
+                "window": self._window,
+                "target": self.segment_duration,
+                "adv_target": self.adv_target,
+                "start_behind": self.start_behind,
+                "disc_seq": self._disc_sequence,
+                "ts": self._last_segment_ts if self._last_segment_ts is not None else time.time(),
+            }
+            self._redis.setex(
+                RedisKeys.output_playlist(self.channel_id, self.fmt),
+                HLS_KEY_TTL,
+                json.dumps(playlist_state),
+            )
+        except Exception as e:
+            logger.error(f"[HLS:{self.channel_id}] Error updating playlist state: {e}")
+
     def _store_segment(self, segment):
         """Store one finished segment and refresh the playlist descriptor."""
         if not self.segment_buffer.put_chunk(segment.data):
@@ -326,30 +395,9 @@ class HLSOutputManager:
             "dur": round(segment.duration, 3),
             "disc": bool(segment.discontinuity),
         })
-        while len(self._window) > self.window_size:
-            # Count discontinuities that roll off and bump DISCONTINUITY-
-            # SEQUENCE so remaining segments keep their DSN (RFC 8216 6.2.2).
-            if self._window.pop(0).get("disc"):
-                self._disc_sequence += 1
-
-        if self._redis:
-            try:
-                playlist_state = {
-                    "window": self._window,
-                    "target": self.segment_duration,
-                    "adv_target": self.adv_target,
-                    "disc_seq": self._disc_sequence,
-                    # Last time this output produced a segment; the playlist
-                    # view uses it to tell a live output from an abandoned one.
-                    "ts": time.time(),
-                }
-                self._redis.setex(
-                    RedisKeys.output_playlist(self.channel_id, self.fmt),
-                    HLS_KEY_TTL,
-                    json.dumps(playlist_state),
-                )
-            except Exception as e:
-                logger.error(f"[HLS:{self.channel_id}] Error updating playlist state: {e}")
+        self._last_segment_ts = time.time()
+        self._prune_playlist_window()
+        self._write_playlist_state()
 
         logger.debug(
             f"[HLS:{self.channel_id}] Segment {seq}: "

@@ -12,7 +12,10 @@ import unittest
 from apps.proxy.live_proxy.output.hls.segmenter import (
     TSSegmenter,
     TS_PACKET_SIZE,
+    extract_parameter_sets,
     extract_pts,
+    packet_continuity_counter,
+    packet_has_decoder_init,
     packet_pid,
     parse_pat,
     parse_pmt,
@@ -241,10 +244,10 @@ class SegmenterTests(unittest.TestCase):
         finished = feed_stream(seg, gop_seconds=2.0, gop_count=9)
         durs = [round(s.duration, 3) for s in finished]
         # Cold start: first segments cut every keyframe for a fast window;
-        # then the normal 4s target resumes. EXTINF is the in-segment PTS
-        # span, so a 2s GOP with pictures through +1.0s yields ~1.0.
-        self.assertEqual(durs[:3], [1.0, 1.0, 1.0])
-        self.assertTrue(all(2.5 < d <= 4.0 for d in durs[3:]), durs)
+        # then the normal 4s target resumes. EXTINF uses keyframe boundary
+        # elapsed (2s GOP), not the in-segment last-PTS shortfall.
+        self.assertEqual(durs[:3], [2.0, 2.0, 2.0])
+        self.assertTrue(all(abs(d - 4.0) < 0.01 for d in durs[3:]), durs)
 
     def test_cuts_on_keyframes_at_target_duration(self):
         seg = self.make_started(target=4.0)
@@ -252,9 +255,8 @@ class SegmenterTests(unittest.TestCase):
         finished = feed_stream(seg, gop_seconds=2.0, gop_count=7)
         self.assertEqual(len(finished), 3)
         for s in finished:
-            # EXTINF is the in-segment PTS span, not keyframe-to-keyframe.
-            self.assertGreater(s.duration, 2.5)
-            self.assertLessEqual(s.duration, 4.0)
+            # 2s GOPs cut every two GOPs: EXTINF is the keyframe boundary (4.0).
+            self.assertAlmostEqual(s.duration, 4.0, places=2)
 
     def test_segments_start_with_pat_pmt(self):
         seg = self.make_started()
@@ -361,10 +363,10 @@ class SegmenterTests(unittest.TestCase):
                 out += seg.feed(make_hevc_pes(pts, [34, 1]))  # PPS + TRAIL
         durs = [round(s.duration, 2) for s in out]
         # One segment per 2s GOP; no mid-GOP shredding from PPS or reorder.
-        # EXTINF is measured PTS span (~1.96 with 25fps), not keyframe delta.
+        # EXTINF follows the keyframe boundary (2.0), not last-PTS shortfall.
         self.assertEqual(len(durs), 3)
         for d in durs:
-            self.assertAlmostEqual(d, 1.96, places=2)
+            self.assertAlmostEqual(d, 2.0, places=2)
 
     def test_encoder_pts_reset_hard_cuts_and_continues(self):
         seg = self.make_started(target=2.0)
@@ -392,12 +394,16 @@ class SegmenterTests(unittest.TestCase):
             out += seg.feed(make_video_pes(t, keyframe=False))
         out += seg.feed(make_video_pes(4.104, keyframe=True))
         self.assertEqual(len(out), 1)
-        # Keyframe spacing is 4.104; media span is 4.280. EXTINF must follow span.
+        # Keyframe spacing is 4.104; media span is 4.280. EXTINF must follow
+        # the larger value so trailing open-GOP pictures are counted.
         self.assertAlmostEqual(out[0].duration, 4.28, places=2)
 
-    def test_extinf_does_not_overstate_closed_gop(self):
-        """Closed GOP: next keyframe is not in the file, so keyframe-delta
-        EXTINF would exceed the media already in the segment."""
+    def test_extinf_closed_gop_uses_keyframe_boundary(self):
+        """Closed GOP: EXTINF is next_keyframe - start, not last_pts - start.
+
+        PTS marks picture start, so last_pts - first_pts alone is ~1 frame
+        short of the presentation covered until the next segment.
+        """
         seg = TSSegmenter(target_duration=4.0, startup_keyframe_cuts=0)
         out = []
         out += seg.feed(make_pat() + make_pmt(H264))
@@ -406,7 +412,129 @@ class SegmenterTests(unittest.TestCase):
             out += seg.feed(make_video_pes(t, keyframe=False))
         out += seg.feed(make_video_pes(4.0, keyframe=True))
         self.assertEqual(len(out), 1)
-        self.assertAlmostEqual(out[0].duration, 3.9, places=2)
+        self.assertAlmostEqual(out[0].duration, 4.0, places=2)
+
+
+def _h264_sps_count(segment_data):
+    """Count H.264 SPS NALs (type 7) visible in Annex-B start codes."""
+    count = 0
+    data = segment_data
+    i = 0
+    while True:
+        found = data.find(b"\x00\x00\x01", i)
+        if found < 0:
+            break
+        hdr = found + 3
+        if hdr < len(data) and (data[hdr] & 0x1F) == 7:
+            count += 1
+        i = hdr
+    return count
+
+
+class ParameterSetInjectTests(unittest.TestCase):
+    def test_extract_and_has_decoder_init(self):
+        with_params = make_h264_pes(0.0, [7, 8, 5])
+        idr_only = make_h264_pes(0.0, [5])
+        self.assertTrue(packet_has_decoder_init(with_params, H264))
+        self.assertFalse(packet_has_decoder_init(idr_only, H264))
+        found = extract_parameter_sets(with_params, H264)
+        self.assertIn(7, found)
+        self.assertIn(8, found)
+        self.assertNotIn(5, found)
+
+    def test_extract_skips_trailing_nal_in_full_unbounded_pes(self):
+        """Unbounded PES filling the packet: trailing SPS may continue next packet."""
+        p = make_pes_header(0.0)
+        p += bytes([0x00, 0x00, 0x00, 0x01, 0x67])  # SPS, no following start code
+        packet = make_packet(VIDEO_PID, p, pusi=True)
+        # Payload-only packets pad with 0xFF, which marks PES end in our helper.
+        # Overwrite padding with 0x00 so the packet looks full of ES.
+        packet = bytearray(packet)
+        for i in range(4, TS_PACKET_SIZE):
+            if packet[i] == 0xFF:
+                packet[i] = 0x00
+        packet = bytes(packet)
+        self.assertEqual(extract_parameter_sets(packet, H264), {})
+
+    def test_injects_cached_sps_pps_when_opening_idr_lacks_them(self):
+        seg = TSSegmenter(target_duration=4.0, startup_keyframe_cuts=0)
+        seg.feed(make_pat())
+        seg.feed(make_pmt(H264))
+        # Seed cache from a full RAP, then close that segment on the next IDR.
+        seg.feed(make_h264_pes(0.0, [7, 8, 5]))
+        out = seg.feed(make_h264_pes(4.0, [5]))  # IDR only: should get inject
+        self.assertEqual(len(out), 1)
+        # First segment opened on the SPS-bearing keyframe: one SPS in-band.
+        self.assertEqual(_h264_sps_count(out[0].data), 1)
+        # Second segment opens on IDR-only; inject should add SPS before it.
+        out2 = seg.feed(make_h264_pes(8.0, [5]))
+        self.assertEqual(len(out2), 1)
+        self.assertGreaterEqual(_h264_sps_count(out2[0].data), 1)
+        # Injected packet sits after PAT/PMT and before the opening IDR.
+        third = out2[0].data[2 * TS_PACKET_SIZE:3 * TS_PACKET_SIZE]
+        self.assertEqual(packet_pid(third), VIDEO_PID)
+        self.assertIn(7, extract_parameter_sets(third, H264))
+        # Continuity: injected CC immediately precedes the opening keyframe CC.
+        idr_pkt = out2[0].data[3 * TS_PACKET_SIZE:4 * TS_PACKET_SIZE]
+        self.assertEqual(
+            (packet_continuity_counter(third) + 1) & 0x0F,
+            packet_continuity_counter(idr_pkt),
+        )
+
+    def test_skips_inject_when_opening_keyframe_already_has_params(self):
+        seg = TSSegmenter(target_duration=4.0, startup_keyframe_cuts=0)
+        seg.feed(make_pat())
+        seg.feed(make_pmt(H264))
+        seg.feed(make_h264_pes(0.0, [7, 8, 5]))
+        out = seg.feed(make_h264_pes(4.0, [7, 8, 5]))
+        self.assertEqual(len(out), 1)
+        # Only the in-band SPS from the opening RAP, not a duplicate inject.
+        self.assertEqual(_h264_sps_count(out[0].data), 1)
+
+    def test_discontinuity_clears_param_cache(self):
+        seg = TSSegmenter(target_duration=4.0, startup_keyframe_cuts=0)
+        seg.feed(make_pat())
+        seg.feed(make_pmt(H264))
+        seg.feed(make_h264_pes(0.0, [7, 8, 5]))
+        self.assertTrue(seg._param_cache_complete())
+        seg.flag_discontinuity()
+        self.assertFalse(seg._param_cache_complete())
+        # IDR-only after the clear must not receive the previous era's SPS.
+        seg.feed(make_h264_pes(100.0, [5]))
+        out = seg.feed(make_h264_pes(104.0, [5]))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(_h264_sps_count(out[0].data), 0)
+
+    def test_pts_reset_reseeds_cache_from_opening_keyframe(self):
+        """Timeline reset clears the cache, then re-seeds from the new RAP."""
+        seg = TSSegmenter(target_duration=4.0, startup_keyframe_cuts=0)
+        seg.feed(make_pat())
+        seg.feed(make_pmt(H264))
+        seg.feed(make_h264_pes(100.0, [7, 8, 5]))
+        # Encoder restart: same packet is the new RAP and carries SPS/PPS.
+        seg.feed(make_h264_pes(0.0, [7, 8, 5]))
+        self.assertTrue(seg._param_cache_complete())
+        # Close the post-reset segment, then an IDR-only RAP must get an inject.
+        out = seg.feed(make_h264_pes(4.0, [5]))
+        self.assertEqual(len(out), 1)
+        out2 = seg.feed(make_h264_pes(8.0, [5]))
+        self.assertEqual(len(out2), 1)
+        self.assertGreaterEqual(_h264_sps_count(out2[0].data), 1)
+
+    def test_hevc_injects_vps_sps_pps(self):
+        seg = TSSegmenter(target_duration=2.0, startup_keyframe_cuts=0)
+        seg.feed(make_pat())
+        seg.feed(make_pmt(HEVC))
+        seg.feed(make_hevc_pes(0.0, [32, 33, 34, 21]))
+        out = seg.feed(make_hevc_pes(2.0, [21]))
+        self.assertEqual(len(out), 1)
+        out2 = seg.feed(make_hevc_pes(4.0, [21]))
+        self.assertEqual(len(out2), 1)
+        injected = out2[0].data[2 * TS_PACKET_SIZE:3 * TS_PACKET_SIZE]
+        found = extract_parameter_sets(injected, HEVC)
+        self.assertIn(32, found)
+        self.assertIn(33, found)
+        self.assertIn(34, found)
 
 
 class PlaylistTests(unittest.TestCase):
@@ -416,7 +544,7 @@ class PlaylistTests(unittest.TestCase):
             {"seq": 8, "dur": 4.2, "disc": False},
             {"seq": 9, "dur": 3.9, "disc": True},
         ]
-        text = render_media_playlist(window, 4)
+        text = render_media_playlist(window, 4, start_behind_seconds=5)
         self.assertIn("#EXTM3U", text)
         self.assertIn("#EXT-X-VERSION:3", text)
         self.assertIn("#EXT-X-TARGETDURATION:5", text)       # ceil(4.2)
@@ -424,9 +552,9 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXTINF:4.200,", text)
         self.assertIn("8.ts", text)
         self.assertNotIn("#EXT-X-ENDLIST", text)             # live
-        # Live-edge start frozen at 2.5x the config target (2.5*4=10), emitted
-        # because the window (12.1s) is deep enough to honor it.
-        self.assertIn("#EXT-X-START:TIME-OFFSET=-10.000,PRECISE=YES", text)
+        # Join offset matches new_client_behind_seconds; emitted once the
+        # window (12.1s) is deep enough to honor it.
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-5.000,PRECISE=YES", text)
         # Discontinuity tag must precede its segment
         lines = text.splitlines()
         self.assertEqual(lines[lines.index("#EXT-X-DISCONTINUITY") + 2], "9.ts")
@@ -459,7 +587,7 @@ class PlaylistTests(unittest.TestCase):
         tds = set()
         starts = set()
         for w in (w1, w2, w3):
-            text = render_media_playlist(w, 4, adv_target=adv)
+            text = render_media_playlist(w, 4, adv_target=adv, start_behind_seconds=5)
             td = [ln for ln in text.splitlines() if ln.startswith("#EXT-X-TARGETDURATION")]
             self.assertEqual(td, ["#EXT-X-TARGETDURATION:8"])
             tds.update(td)
@@ -469,6 +597,18 @@ class PlaylistTests(unittest.TestCase):
                 self.assertLessEqual(round(e["dur"]), adv)
         self.assertEqual(len(tds), 1)      # never changed
         self.assertEqual(len(starts), 1)   # EXT-X-START also byte-stable
+
+    def test_start_behind_gated_until_window_deep_enough(self):
+        # Shallow window: offset larger than playlist duration is omitted.
+        shallow = [{"seq": 1, "dur": 4.0, "disc": False}]
+        text = render_media_playlist(shallow, 4, start_behind_seconds=5)
+        self.assertNotIn("#EXT-X-START", text)
+        deep = [
+            {"seq": 1, "dur": 4.0, "disc": False},
+            {"seq": 2, "dur": 4.0, "disc": False},
+        ]
+        text = render_media_playlist(deep, 4, start_behind_seconds=5)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-5.000,PRECISE=YES", text)
 
 
 AUDIO_PID = 256
